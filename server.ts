@@ -20,10 +20,10 @@ import { join, extname, basename } from 'path'
 import {
   STATE_DIR, ACCESS_FILE, ENV_FILE, INBOX_DIR, MAX_CHUNK, MAX_FILE,
   IMAGE_EXTS, FEISHU_FTYPES, PERMISSION_REPLY_RE, CONFIRM_CHARS,
-  type Access, type PendingEntry, type GroupPolicy,
+  type Access, type PendingEntry, type GroupPolicy, type GateResult,
   makeDebugger, loadEnv, requireCredentials,
   defAccess, readAccess, saveAccess, pruneExpired,
-  assertSendable, assertAllowedChat,
+  assertSendable, assertAllowedChat, gate,
   genConfirmCode, chunkText, checkMention,
   fetchBotOpenId, fetchParentQuote,
   parseMessageContent, buildAttachmentInfo, formatTimestamp,
@@ -139,37 +139,8 @@ function saveAccessCached(a: Access) {
   accessCache.invalidate()
 }
 
-type GateResult = { action: 'deliver'; access: Access } | { action: 'drop' } | { action: 'pair'; code: string; isResend: boolean }
-
-function gate(senderId: string, chatId: string, chatType: string, mentioned: boolean): GateResult {
-  const a = loadAccess()
-  if (pruneExpired(a)) saveAccessCached(a)
-  if (a.dmPolicy === 'disabled') return { action: 'drop' }
-
-  if (chatType === 'p2p') {
-    if (a.allowFrom.includes(senderId)) return { action: 'deliver', access: a }
-    if (a.dmPolicy === 'allowlist') return { action: 'drop' }
-    for (const [code, p] of Object.entries(a.pending)) {
-      if (p.senderId === senderId) {
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        p.replies = (p.replies ?? 1) + 1; saveAccessCached(a)
-        return { action: 'pair', code, isResend: true }
-      }
-    }
-    if (Object.keys(a.pending).length >= 3) return { action: 'drop' }
-    const code = genConfirmCode().slice(0, 6)
-    const now = Date.now()
-    a.pending[code] = { senderId, chatId, createdAt: now, expiresAt: now + 3600000, replies: 1 }
-    saveAccessCached(a)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  const policy = a.groups[chatId]
-  if (!policy) return { action: 'drop' }
-  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return { action: 'drop' }
-  if ((policy.requireMention ?? true) && !mentioned) return { action: 'drop' }
-  return { action: 'deliver', access: a }
-}
+const gateFn = (senderId: string, chatId: string, chatType: string, mentioned: boolean): GateResult =>
+  gate(senderId, chatId, chatType, mentioned, loadAccess, saveAccessCached)
 
 // ── Approval polling ─────────────────────────────────────────────────────────
 
@@ -666,7 +637,7 @@ async function handleInbound(data: any) {
   const access = loadAccess()
   if (mentions.length > 0) dbg(`mentions: ${JSON.stringify(mentions)}, botOpenId=${botOpenId}`)
   const mentioned = checkMention(mentions, text, botOpenId, access.mentionPatterns)
-  const result = gate(senderId, chatId, chatType, mentioned)
+  const result = gateFn(senderId, chatId, chatType, mentioned)
   dbg(`gate result: ${result.action}, senderId=${senderId}, chatId=${chatId}, chatType=${chatType}, mentioned=${mentioned}`)
   if (result.action === 'drop') return
 

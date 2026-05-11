@@ -18,9 +18,9 @@ import { join, resolve } from 'path'
 
 import {
   STATE_DIR, ACCESS_FILE, ENV_FILE,
-  type Access, type GroupPolicy,
+  type Access, type GroupPolicy, type GateResult,
   makeDebugger, loadEnv, requireCredentials,
-  readAccess,
+  readAccess, saveAccess, gate,
   checkMention,
   fetchBotOpenId, fetchParentQuote,
   parseMessageContent, buildAttachmentInfo, formatTimestamp,
@@ -126,13 +126,16 @@ const sockServer = createServer((socket) => {
 
 // ── Message routing ─────────────────────────────────────────────────────────
 
-function resolveWorkdir(chatId: string, chatType: string): string | undefined {
-  const access = loadRouterAccess()
+function resolveWorkdir(chatId: string, chatType: string, access: Access): string | undefined {
   if (chatType === 'group') {
     const wd = access.groups[chatId]?.workdir
     if (wd) return wd
   }
   return access.defaultWorkdir
+}
+
+function saveRouterAccess(a: Access) {
+  saveAccess(a, ACCESS_FILE, STATE_DIR, false)
 }
 
 async function handleInbound(data: any) {
@@ -153,15 +156,21 @@ async function handleInbound(data: any) {
   const { text, postImageKeys } = parseMessageContent(msgType, contentStr)
 
   const access = loadRouterAccess()
+  const mentioned = checkMention(mentions, text, botOpenId, access.mentionPatterns)
+  const result = gate(senderId, chatId, chatType, mentioned, loadRouterAccess, saveRouterAccess)
+  dbg(`gate result: ${result.action}, senderId=${senderId}, chatId=${chatId}, chatType=${chatType}, mentioned=${mentioned}`)
 
-  if (chatType === 'p2p') {
-    if (!access.allowFrom.includes(senderId)) { dbg(`dm from unknown ${senderId}, dropping`); return }
-  } else {
-    const policy = access.groups[chatId]
-    if (!policy) { dbg(`group ${chatId} not configured, dropping`); return }
-    if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return
-    const mentioned = checkMention(mentions, text, botOpenId, access.mentionPatterns)
-    if ((policy.requireMention ?? true) && !mentioned) return
+  if (result.action === 'drop') return
+
+  if (result.action === 'pair') {
+    const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    try {
+      await (apiClient as any).im.message.reply({
+        path: { message_id: messageId },
+        data: { msg_type: 'text', content: JSON.stringify({ text: `${lead} — run in Claude Code:\n\n/feishu:access pair ${result.code}` }), reply_in_thread: false },
+      })
+    } catch (e) { dbg(`pairing reply failed: ${e}`) }
+    return
   }
 
   if (access.ackReaction) {
@@ -180,7 +189,7 @@ async function handleInbound(data: any) {
   const content = quotePrefix + body
   if (!content) return
 
-  const workdir = resolveWorkdir(chatId, chatType)
+  const workdir = resolveWorkdir(chatId, chatType, result.access)
   if (!workdir) { dbg(`no workdir for ${chatId}, dropping`); return }
 
   dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)

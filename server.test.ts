@@ -1,11 +1,11 @@
 import { describe, test, expect } from 'bun:test'
 
 import {
-  chunkText, checkMention, assertAllowedChat, genConfirmCode,
+  chunkText, checkMention, assertAllowedChat, genConfirmCode, gate,
   readAccess, defAccess, pruneExpired, parseMessageContent,
   buildAttachmentInfo, formatTimestamp,
   PERMISSION_REPLY_RE, CONFIRM_CHARS,
-  type Access, type PendingEntry, type GroupPolicy,
+  type Access, type PendingEntry, type GroupPolicy, type GateResult,
   AccessCache,
 } from './shared.ts'
 
@@ -49,53 +49,42 @@ describe('chunkText', () => {
   })
 })
 
-// ---------- gate logic (uses shared types) ----------
-
-function gate(a: Access, senderId: string, chatId: string, chatType: string, mentioned: boolean):
-  { action: 'deliver' } | { action: 'drop' } | { action: 'pair'; code: string; isResend: boolean } {
-  if (a.dmPolicy === 'disabled') return { action: 'drop' }
-  if (chatType === 'p2p') {
-    if (a.allowFrom.includes(senderId)) return { action: 'deliver' }
-    if (a.dmPolicy === 'allowlist') return { action: 'drop' }
-    for (const [code, p] of Object.entries(a.pending)) {
-      if (p.senderId === senderId) {
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        return { action: 'pair', code, isResend: true }
-      }
-    }
-    if (Object.keys(a.pending).length >= 3) return { action: 'drop' }
-    return { action: 'pair', code: 'test-code', isResend: false }
-  }
-  const policy = a.groups[chatId]
-  if (!policy) return { action: 'drop' }
-  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return { action: 'drop' }
-  if ((policy.requireMention ?? true) && !mentioned) return { action: 'drop' }
-  return { action: 'deliver' }
-}
+// ---------- gate logic (uses shared gate function) ----------
 
 function baseAccess(): Access {
   return defAccess()
 }
 
+function gateTest(
+  a: Access, senderId: string, chatId: string, chatType: string, mentioned: boolean,
+): GateResult {
+  const result = gate(
+    senderId, chatId, chatType, mentioned,
+    () => a,
+    (access) => { Object.assign(a, access) },
+  )
+  return result
+}
+
 describe('gate — DM policies', () => {
   test('disabled policy drops all', () => {
     const a = { ...baseAccess(), dmPolicy: 'disabled' as const }
-    expect(gate(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('drop')
   })
 
   test('allowed user delivers', () => {
     const a = { ...baseAccess(), allowFrom: ['ou_user'] }
-    expect(gate(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('deliver')
+    expect(gateTest(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('deliver')
   })
 
   test('unknown user in allowlist mode drops', () => {
     const a = { ...baseAccess(), dmPolicy: 'allowlist' as const }
-    expect(gate(a, 'ou_unknown', 'oc_chat', 'p2p', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_unknown', 'oc_chat', 'p2p', false).action).toBe('drop')
   })
 
   test('unknown user in pairing mode gets code', () => {
     const a = baseAccess()
-    const result = gate(a, 'ou_unknown', 'oc_chat', 'p2p', false)
+    const result = gateTest(a, 'ou_unknown', 'oc_chat', 'p2p', false)
     expect(result.action).toBe('pair')
     if (result.action === 'pair') {
       expect(result.isResend).toBe(false)
@@ -104,7 +93,7 @@ describe('gate — DM policies', () => {
 
   test('pending user gets resend', () => {
     const a = { ...baseAccess(), pending: { abc123: { senderId: 'ou_user', chatId: 'oc_chat', createdAt: Date.now(), expiresAt: Date.now() + 3600000, replies: 1 } } }
-    const result = gate(a, 'ou_user', 'oc_chat', 'p2p', false)
+    const result = gateTest(a, 'ou_user', 'oc_chat', 'p2p', false)
     expect(result.action).toBe('pair')
     if (result.action === 'pair') {
       expect(result.isResend).toBe(true)
@@ -114,7 +103,7 @@ describe('gate — DM policies', () => {
 
   test('pending user with 2+ replies gets dropped', () => {
     const a = { ...baseAccess(), pending: { abc123: { senderId: 'ou_user', chatId: 'oc_chat', createdAt: Date.now(), expiresAt: Date.now() + 3600000, replies: 2 } } }
-    expect(gate(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_user', 'oc_chat', 'p2p', false).action).toBe('drop')
   })
 
   test('too many pending drops new users', () => {
@@ -125,35 +114,35 @@ describe('gate — DM policies', () => {
       c: { senderId: 'ou_3', chatId: 'oc_3', createdAt: now, expiresAt: now + 3600000, replies: 1 },
     }
     const a = { ...baseAccess(), pending }
-    expect(gate(a, 'ou_new', 'oc_new', 'p2p', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_new', 'oc_new', 'p2p', false).action).toBe('drop')
   })
 })
 
 describe('gate — group policies', () => {
   test('unconfigured group drops', () => {
     const a = baseAccess()
-    expect(gate(a, 'ou_user', 'oc_group', 'group', true).action).toBe('drop')
+    expect(gateTest(a, 'ou_user', 'oc_group', 'group', true).action).toBe('drop')
   })
 
   test('configured group without mention drops when requireMention', () => {
     const a = { ...baseAccess(), groups: { oc_group: { requireMention: true, allowFrom: [] } } }
-    expect(gate(a, 'ou_user', 'oc_group', 'group', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_user', 'oc_group', 'group', false).action).toBe('drop')
   })
 
   test('configured group with mention delivers', () => {
     const a = { ...baseAccess(), groups: { oc_group: { requireMention: true, allowFrom: [] } } }
-    expect(gate(a, 'ou_user', 'oc_group', 'group', true).action).toBe('deliver')
+    expect(gateTest(a, 'ou_user', 'oc_group', 'group', true).action).toBe('deliver')
   })
 
   test('group with allowFrom restricts users', () => {
     const a = { ...baseAccess(), groups: { oc_group: { requireMention: false, allowFrom: ['ou_allowed'] } } }
-    expect(gate(a, 'ou_other', 'oc_group', 'group', false).action).toBe('drop')
-    expect(gate(a, 'ou_allowed', 'oc_group', 'group', false).action).toBe('deliver')
+    expect(gateTest(a, 'ou_other', 'oc_group', 'group', false).action).toBe('drop')
+    expect(gateTest(a, 'ou_allowed', 'oc_group', 'group', false).action).toBe('deliver')
   })
 
   test('group without requireMention delivers any message', () => {
     const a = { ...baseAccess(), groups: { oc_group: { requireMention: false, allowFrom: [] } } }
-    expect(gate(a, 'ou_user', 'oc_group', 'group', false).action).toBe('deliver')
+    expect(gateTest(a, 'ou_user', 'oc_group', 'group', false).action).toBe('deliver')
   })
 })
 

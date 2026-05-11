@@ -169,6 +169,46 @@ export function genConfirmCode(): string {
   return Array.from(bytes).map(b => CONFIRM_CHARS[b % CONFIRM_CHARS.length]).join('')
 }
 
+// ── Gate (DM pairing / group access) ─────────────────────────────────────────
+
+export type GateResult =
+  | { action: 'deliver'; access: Access }
+  | { action: 'drop' }
+  | { action: 'pair'; code: string; isResend: boolean }
+
+export function gate(
+  senderId: string, chatId: string, chatType: string, mentioned: boolean,
+  loadAccess: () => Access, saveAccessFn: (a: Access) => void,
+): GateResult {
+  const a = loadAccess()
+  if (pruneExpired(a)) saveAccessFn(a)
+  if (a.dmPolicy === 'disabled') return { action: 'drop' }
+
+  if (chatType === 'p2p') {
+    if (a.allowFrom.includes(senderId)) return { action: 'deliver', access: a }
+    if (a.dmPolicy === 'allowlist') return { action: 'drop' }
+    for (const [code, p] of Object.entries(a.pending)) {
+      if (p.senderId === senderId) {
+        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+        p.replies = (p.replies ?? 1) + 1; saveAccessFn(a)
+        return { action: 'pair', code, isResend: true }
+      }
+    }
+    if (Object.keys(a.pending).length >= 3) return { action: 'drop' }
+    const code = genConfirmCode()
+    const now = Date.now()
+    a.pending[code] = { senderId, chatId, createdAt: now, expiresAt: now + 3600000, replies: 1 }
+    saveAccessFn(a)
+    return { action: 'pair', code, isResend: false }
+  }
+
+  const policy = a.groups[chatId]
+  if (!policy) return { action: 'drop' }
+  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return { action: 'drop' }
+  if ((policy.requireMention ?? true) && !mentioned) return { action: 'drop' }
+  return { action: 'deliver', access: a }
+}
+
 // ── Text chunking ────────────────────────────────────────────────────────────
 
 export function chunkText(text: string, limit: number): string[] {
