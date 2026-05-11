@@ -5,6 +5,8 @@
 
 A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), built on the **native [Channel interface](https://docs.anthropic.com/en/docs/claude-code/channels)**. Chat with Claude directly in Feishu — DMs, group chats, file sharing, interactive cards.
 
+**English** | [中文](./README_CN.md)
+
 Uses the MCP Channel protocol with **WebSocket persistent connection** — no public HTTPS endpoint needed.
 
 ```bash
