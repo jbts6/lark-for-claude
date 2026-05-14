@@ -9,22 +9,14 @@ import {
   readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, chmodSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, sep, extname } from 'path'
-import { realpathSync } from 'fs'
+import { join } from 'path'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 export const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'feishu')
 export const ACCESS_FILE = join(STATE_DIR, 'access.json')
 export const ENV_FILE = join(STATE_DIR, '.env')
-export const INBOX_DIR = join(STATE_DIR, 'inbox')
 export const MAX_CHUNK = 4096
-export const MAX_FILE = 30 * 1024 * 1024
-export const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
-export const FEISHU_FTYPES: Record<string, string> = {
-  '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc', '.xls': 'xls', '.xlsx': 'xls',
-  '.ppt': 'ppt', '.pptx': 'ppt', '.mp4': 'mp4', '.opus': 'opus',
-}
 
 export const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 export const CONFIRM_CHARS = 'abcdefghijkmnopqrstuvwxyz'
@@ -150,18 +142,6 @@ export function pruneExpired(a: Access): boolean {
     if (p.expiresAt < now) { delete a.pending[k]; changed = true }
   }
   return changed
-}
-
-export function assertSendable(f: string, stateDir: string) {
-  try {
-    const real = realpathSync(f), sr = realpathSync(stateDir), inbox = join(sr, 'inbox')
-    if (real.startsWith(sr + sep) && !real.startsWith(inbox + sep)) {
-      throw new Error(`refusing to send channel state: ${f}`)
-    }
-  } catch (e) {
-    if ((e as any).message?.startsWith('refusing')) throw e
-    throw new Error(`cannot resolve path for security check: ${f} — ${e}`)
-  }
 }
 
 export function assertAllowedChat(chatId: string, a: Access) {
