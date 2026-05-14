@@ -60,7 +60,12 @@ const workers = new Map<Socket, Worker>()
 function findWorker(workdir: string): Worker | undefined {
   const target = normalizeWorkdir(workdir)
   for (const w of workers.values()) {
-    if (normalizeWorkdir(w.workdir) === target) return w
+    const wd = normalizeWorkdir(w.workdir)
+    if (wd === target) return w
+  }
+  dbg(`findWorker: target="${target}" workers=${workers.size}`)
+  for (const w of workers.values()) {
+    dbg(`findWorker:  worker="${normalizeWorkdir(w.workdir)}"`)
   }
   return undefined
 }
