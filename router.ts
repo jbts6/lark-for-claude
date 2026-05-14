@@ -16,6 +16,7 @@ import {
 } from 'fs'
 import { join, resolve } from 'path'
 
+import { platform } from 'os'
 import {
   STATE_DIR, ACCESS_FILE, ENV_FILE,
   IS_WIN32, getSocketPath,
@@ -57,11 +58,17 @@ type Worker = { socket: Socket; workdir: string; buf: string }
 const workers = new Map<Socket, Worker>()
 
 function findWorker(workdir: string): Worker | undefined {
-  const target = resolve(workdir)
+  const target = normalizeWorkdir(workdir)
   for (const w of workers.values()) {
-    if (resolve(w.workdir) === target) return w
+    if (normalizeWorkdir(w.workdir) === target) return w
   }
   return undefined
+}
+
+function normalizeWorkdir(p: string): string {
+  let n = resolve(p)
+  if (n.length > 3 && (n.endsWith('/') || n.endsWith('\\'))) n = n.slice(0, -1)
+  return platform() === 'win32' ? n.toLowerCase() : n
 }
 
 function sendToWorker(w: Worker, payload: Record<string, unknown>) {
