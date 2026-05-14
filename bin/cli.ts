@@ -19,7 +19,7 @@ const args = process.argv.slice(3)
 function usage() {
   console.log(`Usage:
   claude-feishu auth [<appId> <appSecret>|key <k> <v>|clear]
-  claude-feishu access [status|pair <code>|deny <code>|allow <id>|remove <id>|policy <mode>|group add/rm <chatId> [--no-mention] [--allow ids]|set <k> <v>]`)
+  claude-feishu access [status|pair <code>|deny <code>|allow <id>|remove <id>|policy <mode>|group add/rm <chatId> [--no-mention] [--allow ids] [--workdir <path>]|set <k> <v>]`)
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ function handleAccess(a: string[]) {
   if (sub === 'group') {
     const action = rest[0]; const chatId = rest[1]
     if (!action || !chatId) {
-      console.error('Usage: claude-feishu access group add|rm <chatId> [--no-mention] [--allow ids]')
+      console.error('Usage: claude-feishu access group add|rm <chatId> [--no-mention] [--allow ids] [--workdir <path>]')
       process.exit(1)
     }
     const ac = readAccess(ACCESS_FILE, () => {})
@@ -194,15 +194,17 @@ function handleAccess(a: string[]) {
       const requireMention = !rest.includes('--no-mention')
       const allowIdx = rest.indexOf('--allow')
       const allowFrom = allowIdx >= 0 ? rest[allowIdx + 1]?.split(',').map(s => s.trim()).filter(Boolean) ?? [] : []
-      ac.groups[chatId] = { requireMention, allowFrom }
+      const workdirIdx = rest.indexOf('--workdir')
+      const workdir = workdirIdx >= 0 ? rest[workdirIdx + 1] : process.cwd()
+      ac.groups[chatId] = { requireMention, allowFrom, workdir }
       saveAccess(ac, ACCESS_FILE, STATE_DIR, false)
-      console.log(`Group ${chatId} added (mention required: ${requireMention})`)
+      console.log(`Group ${chatId} added (mention required: ${requireMention}, workdir: ${workdir})`)
     } else if (action === 'rm' || action === 'remove') {
       delete ac.groups[chatId]
       saveAccess(ac, ACCESS_FILE, STATE_DIR, false)
       console.log(`Group ${chatId} removed`)
     } else {
-      console.error('Usage: claude-feishu access group add|rm <chatId>')
+      console.error('Usage: claude-feishu access group add|rm <chatId> [--no-mention] [--allow ids] [--workdir <path>]')
       process.exit(1)
     }
     return
