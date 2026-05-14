@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * One-command installer for Feishu Channel for Claude Code.
- * Usage: npx feishuchannel-for-claudecode
+ * Usage: npx lark-for-claude
  */
 
 const { execSync } = require('child_process')
@@ -9,8 +9,8 @@ const { existsSync, mkdirSync } = require('fs')
 const { join } = require('path')
 const { homedir } = require('os')
 
-const REPO = 'https://github.com/phxwang/feishuchannel-for-claudecode.git'
-const INSTALL_DIR = join(homedir(), '.local', 'share', 'feishuchannel-for-claudecode')
+const REPO = 'https://github.com/jbts6/lark-for-claude.git'
+const INSTALL_DIR = join(homedir(), '.local', 'share', 'lark-for-claude')
 
 function run(cmd, opts = {}) {
   console.log(`  $ ${cmd}`)

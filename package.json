@@ -1,11 +1,11 @@
 {
-  "name": "feishuchannel-for-claudecode",
-  "version": "0.3.0",
+  "name": "lark-for-claude",
+  "version": "1.1.0",
   "description": "Feishu (Lark) channel plugin for Claude Code — route multiple groups to isolated Claude instances via a single bot",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "feishuchannel-for-claudecode": "./bin/install.js"
+    "lark-for-claude": "./bin/install.js"
   },
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
