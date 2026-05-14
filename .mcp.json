@@ -2,7 +2,7 @@
   "mcpServers": {
     "feishu": {
       "command": "bun",
-      "args": ["--cwd", "${CLAUDE_PLUGIN_ROOT}", "--watch", "server.ts"]
+      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
     }
   }
 }
