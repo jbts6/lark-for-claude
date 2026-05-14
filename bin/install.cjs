@@ -2,50 +2,43 @@
 /**
  * One-command installer for Feishu Channel for Claude Code.
  * Usage: npx lark-for-claude
- *
- * Copies the npm package contents (only files that pass .npmignore)
- * to the install directory, then registers the plugin with Claude Code.
  */
+
 const { execSync } = require('child_process')
-const { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } = require('fs')
-const { join, resolve } = require('path')
+const { existsSync, mkdirSync } = require('fs')
+const { join } = require('path')
 const { homedir } = require('os')
 
+const REPO = 'https://github.com/jbts6/lark-for-claude.git'
 const INSTALL_DIR = join(homedir(), '.local', 'share', 'lark-for-claude')
-const CURRENT_PKG = resolve(__dirname, '..')
 
 function run(cmd, opts = {}) {
   console.log(`  $ ${cmd}`)
   execSync(cmd, { stdio: 'inherit', ...opts })
 }
 
-function copyDir(src, dest) {
-  mkdirSync(dest, { recursive: true })
-  for (const name of readdirSync(src)) {
-    if (name === 'node_modules') continue
-    const s = join(src, name), d = join(dest, name)
-    if (statSync(s).isDirectory()) copyDir(s, d)
-    else copyFileSync(s, d)
-  }
-}
+// ── Prerequisites ──────────────────────────────────────────────────────────
 
-// ── Copy package ──────────────────────────────────────────────────────────
+let ok = true
+if (!ok) process.exit(1)
 
 console.log('\nInstalling Feishu Channel for Claude Code...\n')
 
-if (existsSync(INSTALL_DIR)) {
+// ── Clone or update ────────────────────────────────────────────────────────
+
+if (existsSync(join(INSTALL_DIR, '.git'))) {
   console.log('Updating existing installation...')
-  rmSync(INSTALL_DIR, { recursive: true, force: true })
+  run('git pull', { cwd: INSTALL_DIR })
+} else {
+  mkdirSync(join(homedir(), '.local', 'share'), { recursive: true })
+  run(`git clone "${REPO}" "${INSTALL_DIR}"`)
 }
 
-copyDir(CURRENT_PKG, INSTALL_DIR)
-console.log(`  Copied to ${INSTALL_DIR}`)
-
-// ── Install dependencies ──────────────────────────────────────────────────
+// ── Install dependencies + create claude-feishu shortcut ───────────────────
 
 run('bun install', { cwd: INSTALL_DIR })
 
-// ── Register plugin ───────────────────────────────────────────────────────
+// ── Register plugin ────────────────────────────────────────────────────────
 
 try {
   run(`claude plugin marketplace add "${INSTALL_DIR}"`)
@@ -59,7 +52,7 @@ try {
   // plugin already installed — continue
 }
 
-// ── Done ──────────────────────────────────────────────────────────────────
+// ── Done ───────────────────────────────────────────────────────────────────
 
 console.log(`
 \x1b[32mDone!\x1b[0m Next steps:
