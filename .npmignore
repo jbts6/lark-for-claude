@@ -1,10 +1,15 @@
 *.png
 *.jpg
-.mcp.json
 .claude/
 .playwright-mcp/
-bun.lock
+.trae
+.gitignore
 node_modules/
 server.test.ts
 tsconfig.json
 biome.json
+CLAUDE.md
+prompt.md
+bun.lock
+.env
+*.log
