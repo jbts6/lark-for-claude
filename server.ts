@@ -1,8 +1,30 @@
 #!/usr/bin/env bun
 /**
- * Feishu (Lark) channel for Claude Code.
- * MCP server with access control: allowlists, group mention-triggering.
- * State: ~/.claude/channels/feishu/access.json  Managed by: claude-feishu access CLI.
+ * Feishu (Lark) channel for Claude Code — MCP server.
+ *
+ * Architecture:
+ *
+ *   Claude Code ←(stdio)→ MCP Server ←(Feishu WS/Router)→ Feishu
+ *
+ * Three running modes:
+ *   1. Worker mode:   Connects to router.ts via Unix socket.
+ *                      Router handles WS, forwards messages.
+ *   2. Direct mode:   Own WS connection to Feishu.
+ *                      Used when no router is available.
+ *   3. Passive mode:  No WS, no worker. Only sends messages
+ *                      via tool calls (reply/edit_message).
+ *
+ * Message flow (inbound):
+ *   Feishu WS → handleInbound() → gate() → mcp.notification()
+ *   Router    → socket data    → mcp.notification()
+ *
+ * Message flow (outbound):
+ *   Claude Code → CallTool(reply/edit_message/send_confirm_card)
+ *               → Feishu API
+ *
+ * Permission flow:
+ *   Claude Code → permission_request notification → perm card → user
+ *   User → card action / text reply → handleCardAction() → permission notification
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -12,7 +34,7 @@ import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync, spawn } from 'child_process'
 import { connect as netConnect } from 'net'
 import {
-  readFileSync, readdirSync, rmSync, existsSync,
+  readFileSync, existsSync,
 } from 'fs'
 import { join } from 'path'
 
@@ -22,11 +44,12 @@ import {
   IS_WIN32, getSocketPath,
   type Access, type GateResult,
   makeDebugger, loadEnv, requireCredentials,
-  readAccess, saveAccess,
-  assertAllowedChat, resolveChatId, gate,
+  readAccess,
+  resolveAndAssertChatId, gate,
   genConfirmCode, chunkText, checkMention,
   fetchBotOpenId, fetchParentQuote,
-  parseMessageContent, buildAttachmentInfo, formatTimestamp,
+  parseMessageContent, parseInboundEvent, buildAttachmentInfo, formatTimestamp,
+  parseCardAction, permStatusText, confirmStatusText, buildStatusCard, buildThreeButtonCard,
   AccessCache,
 } from './shared.ts'
 
@@ -61,22 +84,18 @@ function findChannelAncestorPid(): number {
       }
       return 0
     }
-    const lines = execSync(
-      `ps -o pid=,ppid=,args= -ax`,
-      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
-    ).trim().split('\n')
-    const byPid = new Map<number, { ppid: number; args: string }>()
-    for (const line of lines) {
-      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)
-      if (m) byPid.set(Number(m[1]), { ppid: Number(m[2]), args: m[3] ?? '' })
-    }
     let pid = process.ppid
     for (let depth = 0; depth < 5; depth++) {
-      const p = byPid.get(pid)
-      if (!p) break
-      if (/\bchannels?\b/.test(p.args) && /\bfeishu\b/.test(p.args)) return pid
-      pid = p.ppid
-      if (pid <= 1) break
+      try {
+        const out = execSync(`ps -o pid=,ppid=,args= -p ${pid}`, { encoding: 'utf8' }).trim()
+        const m = out.match(/^(\d+)\s+(\d+)\s+(.*)$/)
+        if (!m) break
+        const ppid = Number(m[2])
+        const args = m[3] ?? ''
+        if (/\bchannels?\b/.test(args) && /\bfeishu\b/.test(args)) return pid
+        if (ppid <= 1) break
+        pid = ppid
+      } catch { break }
     }
   } catch (e) { dbg(`findChannelAncestorPid failed: ${e}`) }
   return 0
@@ -168,17 +187,10 @@ process.on('uncaughtException', err => {
 
 const accessCache = new AccessCache(2000)
 
-const BOOT = STATIC ? readAccess(ACCESS_FILE, dbg) : null
-
-const loadAccess = () => BOOT ?? accessCache.get(ACCESS_FILE, dbg)
-
-function saveAccessCached(a: Access) {
-  saveAccess(a, ACCESS_FILE, STATE_DIR, STATIC)
-  accessCache.invalidate()
-}
+const loadAccess = () => STATIC ? readAccess(ACCESS_FILE, dbg) : accessCache.get(ACCESS_FILE, dbg)
 
 const gateFn = (senderId: string, chatId: string, chatType: string, mentioned: boolean): GateResult =>
-  gate(senderId, chatId, chatType, mentioned, loadAccess, saveAccessCached)
+  gate(senderId, chatId, chatType, mentioned, loadAccess)
 
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
@@ -229,123 +241,29 @@ setInterval(prunePending, 60_000).unref()
 
 // ── Card builders ────────────────────────────────────────────────────────────
 
-function buildPermCard(tool_name: string, description: string, request_id: string): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: '🔐 Permission Request' },
-      template: 'orange',
-    },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: `**工具：** \`${tool_name}\`\n\n${description}`,
-        },
-        { tag: 'hr' },
-        {
-          tag: 'column_set',
-          columns: [
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '✅', tag: 'plain_text' },
-                type: 'primary',
-                behaviors: [{ type: 'callback', value: { action: 'perm_allow', code: request_id } }],
-              }],
-            },
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '✅✅', tag: 'plain_text' },
-                type: 'primary',
-                behaviors: [{ type: 'callback', value: { action: 'perm_allow_always', code: request_id } }],
-              }],
-            },
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '❌', tag: 'plain_text' },
-                type: 'danger',
-                behaviors: [{ type: 'callback', value: { action: 'perm_deny', code: request_id } }],
-              }],
-            },
-          ],
-        },
-        { tag: 'hr' },
-        {
-          tag: 'markdown',
-          content: `回复 \`y ${request_id}\` 允许，\`yy ${request_id}\` 一直允许，\`n ${request_id}\` 拒绝`,
-        },
-      ],
-    },
+function buildPermCard(tool_name: string, description: string, code: string): string {
+  return buildThreeButtonCard({
+    headerTitle: '🔐 Permission Request',
+    headerTemplate: 'orange',
+    bodyMarkdown: `**工具：** \`${tool_name}\`\n\n${description}`,
+    allowAction: 'perm_allow',
+    allowAlwaysAction: 'perm_allow_always',
+    denyAction: 'perm_deny',
+    code,
+    replyHint: `回复 \`y ${code}\` 允许，\`yy ${code}\` 一直允许，\`n ${code}\` 拒绝`,
   })
 }
 
 function buildConfirmCard(title: string, content: string, code: string): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: 'blue',
-    },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content,
-        },
-        { tag: 'hr' },
-        {
-          tag: 'column_set',
-          columns: [
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '✅', tag: 'plain_text' },
-                type: 'primary',
-                behaviors: [{ type: 'callback', value: { action: 'confirm', code } }],
-              }],
-            },
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '✅✅', tag: 'plain_text' },
-                type: 'primary',
-                behaviors: [{ type: 'callback', value: { action: 'confirm_always', code } }],
-              }],
-            },
-            {
-              tag: 'column',
-              width: 'auto',
-              elements: [{
-                tag: 'button',
-                text: { content: '❌', tag: 'plain_text' },
-                type: 'danger',
-                behaviors: [{ type: 'callback', value: { action: 'cancel', code } }],
-              }],
-            },
-          ],
-        },
-        { tag: 'hr' },
-        {
-          tag: 'markdown',
-          content: `回复 \`y ${code}\` 允许，\`yy ${code}\` 一直允许，\`n ${code}\` 拒绝`,
-        },
-      ],
-    },
+  return buildThreeButtonCard({
+    headerTitle: title,
+    headerTemplate: 'blue',
+    bodyMarkdown: content,
+    allowAction: 'confirm',
+    allowAlwaysAction: 'confirm_always',
+    denyAction: 'cancel',
+    code,
+    replyHint: `回复 \`y ${code}\` 允许，\`yy ${code}\` 一直允许，\`n ${code}\` 拒绝`,
   })
 }
 
@@ -392,13 +310,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply': {
-        let chatId = a.chat_id as string
+        const access = loadAccess()
+        const chatId = resolveAndAssertChatId(a.chat_id as string | undefined, CLAUDE_WORKDIR, access)
         const text = a.text as string
         const replyTo = a.reply_to as string | undefined
-        const access = loadAccess()
-        if (!chatId) chatId = resolveChatId(CLAUDE_WORKDIR, access) ?? ''
-        if (!chatId) throw new Error('chat_id required — no inbound message and no fallback chat configured')
-        assertAllowedChat(chatId, access)
         const limit = Math.min(access.textChunkLimit ?? MAX_CHUNK, MAX_CHUNK)
         const chunks = chunkText(text, limit)
         const ids: string[] = []
@@ -413,27 +328,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       
       case 'edit_message': {
-        let editChatId = a.chat_id as string
-        const editAccess = loadAccess()
-        if (!editChatId) editChatId = resolveChatId(CLAUDE_WORKDIR, editAccess) ?? ''
-        if (!editChatId) throw new Error('chat_id required — no inbound message and no fallback chat configured')
-        assertAllowedChat(editChatId, editAccess)
+        const access = loadAccess()
+        const chatId = resolveAndAssertChatId(a.chat_id as string | undefined, CLAUDE_WORKDIR, access)
         await (apiClient as any).im.message.update({ path: { message_id: a.message_id as string }, data: { msg_type: 'text', content: JSON.stringify({ text: a.text as string }) } })
         return { content: [{ type: 'text', text: `edited (id: ${a.message_id})` }] }
       }
      
       case 'send_confirm_card': {
-        let confirmChatId = a.chat_id as string
+        const access = loadAccess()
+        const chatId = resolveAndAssertChatId(a.chat_id as string | undefined, CLAUDE_WORKDIR, access)
         const content = a.content as string
         const title = (a.title as string | undefined) ?? '⚡ 操作确认'
-        const confirmAccess = loadAccess()
-        if (!confirmChatId) confirmChatId = resolveChatId(CLAUDE_WORKDIR, confirmAccess) ?? ''
-        if (!confirmChatId) throw new Error('chat_id required — no inbound message and no fallback chat configured')
-        assertAllowedChat(confirmChatId, confirmAccess)
         const code = genConfirmCode()
-        pendingConfirms.set(code, { chatId: confirmChatId, senderId: '', title, content, createdAt: Date.now() })
+        pendingConfirms.set(code, { chatId, senderId: '', title, content, createdAt: Date.now() })
         const card = buildConfirmCard(title, content, code)
-        const r = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: confirmChatId, msg_type: 'interactive', content: card } })
+        const r = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: card } })
         const msgId = (r as any)?.message_id ?? (r as any)?.data?.message_id ?? ''
         return { content: [{ type: 'text', text: `confirm card sent (code: ${code}, id: ${msgId}) — waiting for CONFIRMED ${code} or CANCELLED ${code}` }] }
       }
@@ -450,30 +359,25 @@ function redact(s: string): string {
   return s.replace(/ou_[a-zA-Z0-9]+/g, 'ou_***').replace(/oc_[a-zA-Z0-9]+/g, 'oc_***').replace(/om_[a-zA-Z0-9]+/g, 'om_***')
 }
 
+/** Handle card action callbacks (permission allow/deny, confirm/cancel). Updates pending state and sends MCP notifications. */
 async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   dbg(`handleCardAction: ${redact(JSON.stringify(data).slice(0, 500))}`)
   const value = data?.action?.value ?? {}
-  const code = value.code as string | undefined
-  const action = value.action as string | undefined
-  if (!code || !action) return {}
+  const parsed = parseCardAction(value)
+  if (parsed.type === 'unknown') return {}
 
-  if (action === 'perm_allow' || action === 'perm_allow_always' || action === 'perm_deny') {
-    const behavior = action === 'perm_deny' ? 'deny' : action === 'perm_allow_always' ? 'allow-always' : 'allow'
+  if (parsed.type === 'perm') {
+    const { code, behavior } = parsed
     void mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: code, behavior } })
     const perm = pendingPerms.get(code)
     pendingPerms.delete(code)
-    const statusText = behavior === 'deny' ? '❌ 已拒绝' : behavior === 'allow-always' ? '✅✅ 已一直允许' : '✅ 已允许'
+    const statusText = permStatusText(behavior)
     return {
       toast: { type: behavior === 'deny' ? 'info' : 'success', content: statusText },
       card: {
         type: 'raw',
         data: {
-          schema: '2.0',
-          config: { wide_screen_mode: true },
-          header: {
-            title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` },
-            template: behavior === 'deny' ? 'grey' : 'green',
-          },
+          ...buildStatusCard(`🔐 Permission Request — ${statusText}`, statusText, behavior === 'deny' ? 'grey' : 'green'),
           body: {
             elements: [
               ...(perm ? [{ tag: 'markdown', content: `**工具：** \`${perm.tool_name}\`\n\n${perm.description}` }] : []),
@@ -486,11 +390,10 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
     }
   }
 
+  const { code, isConfirm, isAlways } = parsed
   const pending = pendingConfirms.get(code)
   if (!pending) return {}
   pendingConfirms.delete(code)
-  const isConfirm = action === 'confirm' || action === 'confirm_always'
-  const isAlways = action === 'confirm_always'
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -505,18 +408,13 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
       },
     },
   })
-  const statusText = !isConfirm ? '❌ 已拒绝' : isAlways ? '✅✅ 已一直允许' : '✅ 已确认'
+  const statusText = confirmStatusText(isConfirm, isAlways)
   return {
     toast: { type: isConfirm ? 'success' : 'info', content: statusText },
     card: {
       type: 'raw',
       data: {
-        schema: '2.0',
-        config: { wide_screen_mode: true },
-        header: {
-          title: { tag: 'plain_text', content: `${pending.title || '⚡ 操作确认'} — ${statusText}` },
-          template: isConfirm ? 'green' : 'grey',
-        },
+        ...buildStatusCard(`${pending.title || '⚡ 操作确认'} — ${statusText}`, statusText, isConfirm ? 'green' : 'grey'),
         body: {
           elements: [
             ...(pending.content ? [{ tag: 'markdown', content: pending.content }] : []),
@@ -531,22 +429,12 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 
 // ── Inbound message handler ──────────────────────────────────────────────────
 
+/** Handle inbound Feishu message: gate-check, process permission replies, deliver to Claude Code. */
 async function handleInbound(data: any) {
-  const ev = data.event ?? data
-  const sender = ev.sender, message = ev.message
-  dbg(`handleInbound: sender=${redact(JSON.stringify(sender?.sender_id))}, chat_id=${redact(message?.chat_id ?? '')}, chat_type=${message?.chat_type}, msg_type=${message?.message_type}`)
-  if (!sender || !message) { dbg('drop: missing sender or message'); return }
-  const senderId: string = sender.sender_id?.open_id ?? ''
-  const chatId: string = message.chat_id ?? ''
-  const chatType: string = message.chat_type ?? 'p2p'
-  const messageId: string = message.message_id ?? ''
-  const msgType: string = message.message_type ?? (message as any).msg_type ?? 'text'
-  const contentStr: string = message.content ?? message.body?.content ?? ''
-  const mentions: any[] = message.mentions ?? []
-  const createTime: string = message.create_time ?? ''
-  if (!senderId || !chatId || !messageId) { dbg(`drop: missing ids senderId=${senderId} chatId=${chatId} messageId=${messageId}`); return }
-
-  const { text, postImageKeys } = parseMessageContent(msgType, contentStr)
+  const parsed = parseInboundEvent(data)
+  if (!parsed) { dbg('drop: missing sender or message'); return }
+  const { senderId, chatId, chatType, messageId, msgType, contentStr, mentions, createTime, parentId, text, postImageKeys } = parsed
+  dbg(`handleInbound: sender=${redact(senderId)}, chat_id=${redact(chatId)}, chat_type=${chatType}, msg_type=${msgType}`)
 
   const access = loadAccess()
   if (mentions.length > 0) dbg(`mentions: ${JSON.stringify(mentions)}, botOpenId=${botOpenId}`)
@@ -578,12 +466,11 @@ async function handleInbound(data: any) {
     return
   }
 
-  if (result.access.ackReaction) void (apiClient as any).im.messageReaction.create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: result.access.ackReaction } } }).catch((e: unknown) => dbg(`ack reaction failed: ${e}`))
+  if (access.ackReaction) void (apiClient as any).im.messageReaction.create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: access.ackReaction } } }).catch((e: unknown) => dbg(`ack reaction failed: ${e}`))
 
   const atts = buildAttachmentInfo(msgType, contentStr, postImageKeys)
   const ts = formatTimestamp(createTime)
 
-  const parentId: string = (message as any).parent_id ?? ''
   const quotePrefix = parentId ? await fetchParentQuote(apiClient, parentId, dbg) : ''
   const body = text || (atts.length ? '(attachment)' : '')
   const content = quotePrefix + body

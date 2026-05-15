@@ -2,30 +2,33 @@
 /**
  * Feishu Router — central message hub for multiple Claude Code instances.
  *
- * Maintains the single Feishu WebSocket connection. Workers (server.ts in each
- * Claude Code instance) connect via a Unix socket and register their cwd.
- * Messages are routed by:  chat_id → workdir (access.json) → registered worker.
+ * Flow:
+ *   Feishu WS → handleInbound() → gate() → resolveWorkdir() → findWorker()
+ *             → socket → worker (server.ts)
  *
- * Usage:  bun router.ts
- * Config: ~/.claude/channels/feishu/access.json  (groups.<chatId>.workdir, defaultWorkdir)
+ *   Worker → socket → (register workdir)
+ *
+ *   Card action → handleCardAction() → route to worker by workdir
+ *
+ * Worker routing:
+ *   chat_id → access.json groups → workdir → registered worker socket
  */
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
 import {
-  readFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
+  mkdirSync, chmodSync, unlinkSync, existsSync,
 } from 'fs'
-import { join, resolve } from 'path'
-
-import { platform } from 'os'
+import { join } from 'path'
 import {
   STATE_DIR, ACCESS_FILE, ENV_FILE,
   IS_WIN32, getSocketPath,
-  type Access, type GroupPolicy, type GateResult,
+  type Access,
   makeDebugger, loadEnv, requireCredentials,
-  readAccess, saveAccess, gate,
+  readAccess, gate, normalizePath,
   checkMention,
   fetchBotOpenId, fetchParentQuote,
-  parseMessageContent, buildAttachmentInfo, formatTimestamp,
+  parseMessageContent, parseInboundEvent, buildAttachmentInfo, formatTimestamp,
+  parseCardAction, permStatusText, confirmStatusText, buildStatusCard,
   AccessCache,
 } from './shared.ts'
 
@@ -61,23 +64,16 @@ type Worker = { socket: Socket; workdir: string; buf: string }
 const workers = new Map<Socket, Worker>()
 
 function findWorker(workdir: string): Worker | undefined {
-  const target = normalizeWorkdir(workdir)
+  const target = normalizePath(workdir)
   dbg(`findWorker: target="${target}"`)
   for (const w of workers.values()) {
-    const wd = normalizeWorkdir(w.workdir)
-    if (wd === target) return w
+    if (normalizePath(w.workdir) === target) return w
   }
   dbg(`findWorker: target="${target}" workers=${workers.size}`)
   for (const w of workers.values()) {
-    dbg(`findWorker:  worker="${normalizeWorkdir(w.workdir)}"`)
+    dbg(`findWorker:  worker="${normalizePath(w.workdir)}"`)
   }
   return undefined
-}
-
-function normalizeWorkdir(p: string): string {
-  let n = resolve(p)
-  if (n.length > 3 && (n.endsWith('/') || n.endsWith('\\'))) n = n.slice(0, -1)
-  return platform() === 'win32' ? n.toLowerCase() : n
 }
 
 function sendToWorker(w: Worker, payload: Record<string, unknown>) {
@@ -121,7 +117,7 @@ const sockServer = createServer((socket) => {
       try {
         const msg = JSON.parse(line)
         if (msg.type === 'register' && msg.workdir) {
-          w.workdir = resolve(msg.workdir)
+          w.workdir = normalizePath(msg.workdir)
           dbg(`worker registered: ${w.workdir}`)
         }
       } catch (e) { dbg(`bad message from worker: ${e}`) }
@@ -151,52 +147,35 @@ function resolveWorkdir(chatId: string, chatType: string, access: Access): strin
   return access.defaultWorkdir
 }
 
-function saveRouterAccess(a: Access) {
-  saveAccess(a, ACCESS_FILE, STATE_DIR, false)
-  routerAccessCache.invalidate()
-}
-
+/** Route inbound Feishu message to the appropriate worker by workdir. */
 async function handleInbound(data: any) {
-  const ev = data.event ?? data
-  const sender = ev.sender, message = ev.message
-  if (!sender || !message) return
-
-  const senderId: string = sender.sender_id?.open_id ?? ''
-  const chatId: string = message.chat_id ?? ''
-  const chatType: string = message.chat_type ?? 'p2p'
-  const messageId: string = message.message_id ?? ''
-  const msgType: string = message.message_type ?? (message as any).msg_type ?? 'text'
-  const contentStr: string = message.content ?? message.body?.content ?? ''
-  const mentions: any[] = message.mentions ?? []
-  const createTime: string = message.create_time ?? ''
-  if (!senderId || !chatId || !messageId) return
-
-  const { text, postImageKeys } = parseMessageContent(msgType, contentStr)
+  const parsed = parseInboundEvent(data)
+  if (!parsed) return
+  const { senderId, chatId, chatType, messageId, msgType, contentStr, mentions, createTime, parentId, text, postImageKeys } = parsed
 
   const access = loadRouterAccess()
   const mentioned = checkMention(mentions, text, botOpenId, access.mentionPatterns)
-  const result = gate(senderId, chatId, chatType, mentioned, loadRouterAccess, saveRouterAccess)
+  const result = gate(senderId, chatId, chatType, mentioned, loadRouterAccess)
   dbg(`gate result: ${result.action}, senderId=${senderId}, chatId=${chatId}, chatType=${chatType}, mentioned=${mentioned}`)
 
   if (result.action === 'drop') return
 
-  if (result.access.ackReaction) {
+  if (access.ackReaction) {
     void (apiClient as any).im.messageReaction.create({
       path: { message_id: messageId },
-      data: { reaction_type: { emoji_type: result.access.ackReaction } },
+      data: { reaction_type: { emoji_type: access.ackReaction } },
     }).catch((e: unknown) => dbg(`ack reaction failed: ${e}`))
   }
 
   const atts = buildAttachmentInfo(msgType, contentStr, postImageKeys)
   const ts = formatTimestamp(createTime)
 
-  const parentId: string = (message as any).parent_id ?? ''
   const quotePrefix = parentId ? await fetchParentQuote(apiClient, parentId, dbg) : ''
   const body = text || (atts.length ? '(attachment)' : '')
   const content = quotePrefix + body
   if (!content) return
 
-  const workdir = resolveWorkdir(chatId, chatType, result.access)
+  const workdir = resolveWorkdir(chatId, chatType, access)
   if (!workdir) { dbg(`no workdir for ${chatId}, dropping`); return }
 
   dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)
@@ -223,69 +202,50 @@ async function handleInbound(data: any) {
   }
 }
 
+/** Handle card action callbacks by routing permission/confirm responses to the appropriate worker. */
 async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const value = data?.action?.value ?? {}
-  const code = value.code as string | undefined
-  const action = value.action as string | undefined
-  if (!code || !action) return {}
+  const parsed = parseCardAction(value)
+  if (parsed.type === 'unknown') return {}
 
   const chatId = data?.open_chat_id ?? ''
   const access = loadRouterAccess()
   const workdir = chatId ? resolveWorkdir(chatId, 'group', access) ?? resolveWorkdir(chatId, 'p2p', access) : undefined
 
-  if (action === 'perm_allow' || action === 'perm_allow_always' || action === 'perm_deny') {
-    const behavior = action === 'perm_deny' ? 'deny' : action === 'perm_allow_always' ? 'allow-always' : 'allow'
+  if (parsed.type === 'perm') {
+    const { code, behavior } = parsed
     const payload = { type: 'permission_response', request_id: code, behavior }
     if (workdir) routeToWorkdir(workdir, payload)
     else for (const w of workers.values()) sendToWorker(w, payload)
 
-    const statusText = behavior === 'deny' ? '❌ 已拒绝' : behavior === 'allow-always' ? '✅✅ 已一直允许' : '✅ 已允许'
+    const statusText = permStatusText(behavior)
     return {
       toast: { type: behavior === 'deny' ? 'info' : 'success', content: statusText },
-      card: {
-        type: 'raw',
-        data: {
-          schema: '2.0', config: { wide_screen_mode: true },
-          header: { title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` }, template: behavior === 'deny' ? 'grey' : 'green' },
-          body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${statusText}**` }] },
-        },
-      },
+      card: { type: 'raw', data: buildStatusCard(`🔐 Permission Request — ${statusText}`, statusText, behavior === 'deny' ? 'grey' : 'green') },
     }
   }
 
-  if (action === 'confirm' || action === 'confirm_always' || action === 'cancel') {
-    const isConfirm = action === 'confirm' || action === 'confirm_always'
-    const isAlways = action === 'confirm_always'
-    const payload = {
-      type: 'confirm_response',
-      content: isAlways ? `CONFIRMED_ALWAYS ${code}` : isConfirm ? `CONFIRMED ${code}` : `CANCELLED ${code}`,
-      meta: {
-        chat_id: chatId || 'system',
-        message_id: `card-${Date.now()}`,
-        user: 'system',
-        user_id: 'system',
-        ts: new Date().toISOString(),
-        chat_type: 'p2p',
-      },
-    }
-    if (workdir) routeToWorkdir(workdir, payload)
-    else for (const w of workers.values()) sendToWorker(w, payload)
-
-    const statusText = !isConfirm ? '❌ 已拒绝' : isAlways ? '✅✅ 已一直允许' : '✅ 已确认'
-    return {
-      toast: { type: isConfirm ? 'success' : 'info', content: statusText },
-      card: {
-        type: 'raw',
-        data: {
-          schema: '2.0', config: { wide_screen_mode: true },
-          header: { title: { tag: 'plain_text', content: `⚡ 操作确认 — ${statusText}` }, template: isConfirm ? 'green' : 'grey' },
-          body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${statusText}**` }] },
-        },
-      },
-    }
+  const { code, isConfirm, isAlways } = parsed
+  const payload = {
+    type: 'confirm_response',
+    content: isAlways ? `CONFIRMED_ALWAYS ${code}` : isConfirm ? `CONFIRMED ${code}` : `CANCELLED ${code}`,
+    meta: {
+      chat_id: chatId || 'system',
+      message_id: `card-${Date.now()}`,
+      user: 'system',
+      user_id: 'system',
+      ts: new Date().toISOString(),
+      chat_type: 'p2p',
+    },
   }
+  if (workdir) routeToWorkdir(workdir, payload)
+  else for (const w of workers.values()) sendToWorker(w, payload)
 
-  return {}
+  const statusText = confirmStatusText(isConfirm, isAlways)
+  return {
+    toast: { type: isConfirm ? 'success' : 'info', content: statusText },
+    card: { type: 'raw', data: buildStatusCard(`⚡ 操作确认 — ${statusText}`, statusText, isConfirm ? 'green' : 'grey') },
+  }
 }
 
 // ── Startup ─────────────────────────────────────────────────────────────────

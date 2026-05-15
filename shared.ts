@@ -1,7 +1,37 @@
 #!/usr/bin/env bun
 /**
  * Shared types, constants, and utilities for server.ts and router.ts.
- * Eliminates code duplication between the two modules.
+ *
+ * Module structure:
+ * ┌──────────────────────────────────────────────────────────────┐
+ * │ Constants          STATE_DIR, ACCESS_FILE, ENV_FILE, etc.   │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Platform helpers   IS_WIN32, getSocketPath()                │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Types              Access, GroupPolicy, GateResult, etc.    │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Debug logging      rotateLogIfNeeded(), makeDebugger()      │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Environment        loadEnv(), requireCredentials()          │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Access control     defAccess(), readAccess(), saveAccess(), │
+ * │                    assertAllowedChat(), resolveChatId(),     │
+ * │                    resolveAndAssertChatId(), gate()          │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Confirm codes      genConfirmCode()                         │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Text processing    chunkText(), checkMention()              │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Feishu API         fetchBotOpenId(), fetchParentQuote()     │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Message parsing    parseInboundEvent(), parseMessageContent()│
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Card building      buildThreeButtonCard(), parseCardAction()│
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Utilities          buildAttachmentInfo(), formatTimestamp() │
+ * ├──────────────────────────────────────────────────────────────┤
+ * │ Caching            AccessCache                              │
+ * └──────────────────────────────────────────────────────────────┘
  */
 import * as lark from '@larksuiteoapi/node-sdk'
 import { randomBytes } from 'crypto'
@@ -184,6 +214,7 @@ export function assertAllowedChat(chatId: string, a: Access) {
   throw new Error(`chat ${chatId} is not allowlisted — add via claude-feishu access`)
 }
 
+/** Resolve chat_id by matching workdir against access.json groups, then fall back to FEISHU_APP_CHAT_ID. */
 export function resolveChatId(workdir: string | undefined, access: Access): string | undefined {
   const cwd = workdir ? normalizePath(workdir) : undefined
   if (cwd) {
@@ -196,7 +227,17 @@ export function resolveChatId(workdir: string | undefined, access: Access): stri
 
 const normalizePathCache = new Map<string, string>()
 
-function normalizePath(p: string): string {
+/** Resolve chat_id from explicit value or workdir fallback, then assert it is allowlisted. Throws if unresolvable or unauthorized. */
+export function resolveAndAssertChatId(chatId: string | undefined, workdir: string | undefined, access: Access): string {
+  let resolved = chatId ?? ''
+  if (!resolved) resolved = resolveChatId(workdir, access) ?? ''
+  if (!resolved) throw new Error('chat_id required — no inbound message and no fallback chat configured')
+  assertAllowedChat(resolved, access)
+  return resolved
+}
+
+/** Normalize a filesystem path: resolve symlinks, strip trailing slashes, lowercase on Windows. Results are cached. */
+export function normalizePath(p: string): string {
   const cached = normalizePathCache.get(p)
   if (cached !== undefined) return cached
   let result = p
@@ -217,18 +258,24 @@ export function genConfirmCode(): string {
 // ── Gate (DM / group access) ─────────────────────────────────────────────────
 
 export type GateResult =
-  | { action: 'deliver'; access: Access }
+  | { action: 'deliver' }
   | { action: 'drop' }
 
+/**
+ * DM / group access gate.
+ * - DM: allowlist only (dmPolicy='disabled' drops all).
+ * - Group: must be in access.groups; optionally require mention or restrict by allowFrom.
+ * Returns { action: 'deliver' } or { action: 'drop' }.
+ */
 export function gate(
   senderId: string, chatId: string, chatType: string, mentioned: boolean,
-  loadAccess: () => Access, _saveAccessFn: (a: Access) => void,
+  loadAccess: () => Access,
 ): GateResult {
   const a = loadAccess()
   if (a.dmPolicy === 'disabled') return { action: 'drop' }
 
   if (chatType === 'p2p') {
-    if (a.allowFrom.includes(senderId)) return { action: 'deliver', access: a }
+    if (a.allowFrom.includes(senderId)) return { action: 'deliver' }
     return { action: 'drop' }
   }
 
@@ -236,7 +283,7 @@ export function gate(
   if (!policy) return { action: 'drop' }
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return { action: 'drop' }
   if ((policy.requireMention ?? true) && !mentioned) return { action: 'drop' }
-  return { action: 'deliver', access: a }
+  return { action: 'deliver' }
 }
 
 // ── Text chunking ────────────────────────────────────────────────────────────
@@ -304,6 +351,39 @@ export async function fetchParentQuote(apiClient: lark.Client, parentId: string,
 
 // ── Message parsing ──────────────────────────────────────────────────────────
 
+export type InboundEvent = {
+  senderId: string
+  chatId: string
+  chatType: string
+  messageId: string
+  msgType: string
+  contentStr: string
+  mentions: any[]
+  createTime: string
+  parentId: string
+  text: string
+  postImageKeys: string[]
+}
+
+/** Parse a Feishu inbound event into a structured object. Returns null if sender/message missing or IDs invalid. */
+export function parseInboundEvent(data: any): InboundEvent | null {
+  const ev = data.event ?? data
+  const sender = ev.sender, message = ev.message
+  if (!sender || !message) return null
+  const senderId: string = sender.sender_id?.open_id ?? ''
+  const chatId: string = message.chat_id ?? ''
+  const chatType: string = message.chat_type ?? 'p2p'
+  const messageId: string = message.message_id ?? ''
+  const msgType: string = message.message_type ?? (message as any).msg_type ?? 'text'
+  const contentStr: string = message.content ?? message.body?.content ?? ''
+  const mentions: any[] = message.mentions ?? []
+  const createTime: string = message.create_time ?? ''
+  const parentId: string = (message as any).parent_id ?? ''
+  if (!senderId || !chatId || !messageId) return null
+  const { text, postImageKeys } = parseMessageContent(msgType, contentStr)
+  return { senderId, chatId, chatType, messageId, msgType, contentStr, mentions, createTime, parentId, text, postImageKeys }
+}
+
 export type ParsedMessage = {
   text: string
   postImageKeys: string[]
@@ -356,6 +436,81 @@ export function formatTimestamp(createTime: string): string {
   return new Date(n > 1e12 ? n : n * 1000).toISOString()
 }
 
+// ── Card action parsing ──────────────────────────────────────────────────────
+
+export type CardActionParsed =
+  | { type: 'perm'; code: string; behavior: 'allow' | 'allow-always' | 'deny' }
+  | { type: 'confirm'; code: string; isConfirm: boolean; isAlways: boolean }
+  | { type: 'unknown' }
+
+/** Parse a card action callback value into a typed discriminated union. */
+export function parseCardAction(value: Record<string, any>): CardActionParsed {
+  const code = value.code as string | undefined
+  const action = value.action as string | undefined
+  if (!code || !action) return { type: 'unknown' }
+  if (action === 'perm_allow' || action === 'perm_allow_always' || action === 'perm_deny') {
+    return { type: 'perm', code, behavior: action === 'perm_deny' ? 'deny' : action === 'perm_allow_always' ? 'allow-always' : 'allow' }
+  }
+  if (action === 'confirm' || action === 'confirm_always' || action === 'cancel') {
+    const isConfirm = action !== 'cancel'
+    const isAlways = action === 'confirm_always'
+    return { type: 'confirm', code, isConfirm, isAlways }
+  }
+  return { type: 'unknown' }
+}
+
+export function permStatusText(behavior: 'allow' | 'allow-always' | 'deny'): string {
+  return behavior === 'deny' ? '❌ 已拒绝' : behavior === 'allow-always' ? '✅✅ 已一直允许' : '✅ 已允许'
+}
+
+export function confirmStatusText(isConfirm: boolean, isAlways: boolean): string {
+  return !isConfirm ? '❌ 已拒绝' : isAlways ? '✅✅ 已一直允许' : '✅ 已确认'
+}
+
+export function buildStatusCard(headerTitle: string, bodyContent: string, template: 'green' | 'grey'): Record<string, any> {
+  return {
+    schema: '2.0', config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: headerTitle }, template },
+    body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${bodyContent}**` }] },
+  }
+}
+
+// ── Card building ────────────────────────────────────────────────────────────
+
+/** Build a Feishu interactive card with ✅/✅✅/❌ buttons and a text-reply hint. */
+export function buildThreeButtonCard(opts: {
+  headerTitle: string
+  headerTemplate: string
+  bodyMarkdown: string
+  allowAction: string
+  allowAlwaysAction: string
+  denyAction: string
+  code: string
+  replyHint: string
+}): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: opts.headerTitle }, template: opts.headerTemplate },
+    body: {
+      elements: [
+        { tag: 'markdown', content: opts.bodyMarkdown },
+        { tag: 'hr' },
+        {
+          tag: 'column_set',
+          columns: [
+            { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { content: '✅', tag: 'plain_text' }, type: 'primary', behaviors: [{ type: 'callback', value: { action: opts.allowAction, code: opts.code } }] }] },
+            { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { content: '✅✅', tag: 'plain_text' }, type: 'primary', behaviors: [{ type: 'callback', value: { action: opts.allowAlwaysAction, code: opts.code } }] }] },
+            { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { content: '❌', tag: 'plain_text' }, type: 'danger', behaviors: [{ type: 'callback', value: { action: opts.denyAction, code: opts.code } }] }] },
+          ],
+        },
+        { tag: 'hr' },
+        { tag: 'markdown', content: opts.replyHint },
+      ],
+    },
+  })
+}
+
 // ── Access cache with TTL ────────────────────────────────────────────────────
 
 export class AccessCache {
@@ -367,15 +522,14 @@ export class AccessCache {
 
   get(accessFile: string, dbg: (msg: string) => void): Access {
     try {
-      const stat = { mtimeMs: 0 }
+      let mtimeMs = 0
       try {
-        const fs = require('fs')
-        const s = fs.statSync(accessFile)
-        stat.mtimeMs = s.mtimeMs
+        const s = statSync(accessFile)
+        mtimeMs = s.mtimeMs
       } catch {}
-      if (this.cached && stat.mtimeMs === this.mtimeMs) return this.cached
+      if (this.cached && mtimeMs === this.mtimeMs) return this.cached
       this.cached = readAccess(accessFile, dbg)
-      this.mtimeMs = stat.mtimeMs
+      this.mtimeMs = mtimeMs
       return this.cached
     } catch {
       this.cached = null

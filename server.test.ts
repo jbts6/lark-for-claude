@@ -11,7 +11,7 @@ import {
   buildAttachmentInfo, formatTimestamp,
   PERMISSION_REPLY_RE, CONFIRM_CHARS,
   rotateLogIfNeeded, MAX_LOG_SIZE,
-  type Access, type GroupPolicy, type GateResult,
+  type Access, type GateResult,
   AccessCache,
 } from './shared.ts'
 
@@ -67,7 +67,6 @@ function gateTest(
   const result = gate(
     senderId, chatId, chatType, mentioned,
     () => a,
-    (access) => { Object.assign(a, access) },
   )
   return result
 }

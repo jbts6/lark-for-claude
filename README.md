@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/lark-for-claude)](https://www.npmjs.com/package/lark-for-claude)
 [![license](https://img.shields.io/npm/l/lark-for-claude)](LICENSE)
 
-A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), built on the **native [Channel interface](https://docs.anthropic.com/en/docs/claude-code/channels)**. Chat with Claude directly in Feishu — DMs, group chats, file sharing, interactive cards.
+A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), built on the **native [Channel interface](https://docs.anthropic.com/en/docs/claude-code/channels)**. Chat with Claude directly in Feishu — DMs, group chats, interactive cards.
 
 **English** | [中文](./README_CN.md)
 
@@ -64,7 +64,6 @@ The plugin operates in **three modes**, selected automatically based on runtime 
 |---|---|---|---|
 | **Connection** | Direct Feishu WebSocket | Unix socket → Router → Feishu WebSocket | None |
 | **Use case** | Single user / single project | Multi-user / multi-project | Non-channel Claude instances |
-| **DM pairing** | ✅ Supported | ✅ Supported (via Router) | N/A |
 | **Message routing** | All messages → this instance | chat_id → workdir → worker | N/A |
 | **Auto-started** | Fallback when Router fails | First `claude-feishu` auto-spawns Router | Always |
 | **How many instances** | 1 Claude per bot | N Claudes per bot | N/A |
@@ -99,7 +98,6 @@ chat_id → groups[chat_id].workdir → registered worker (by cwd)
 - First `claude-feishu` **auto-spawns** the Router process
 - Subsequent instances **auto-connect** as workers
 - When all workers disconnect, Router **auto-shuts down** after 10s grace period
-- DM pairing is handled by the Router — new users get pairing codes just like Channel mode
 - If Router fails to start, falls back to Channel Mode
 
 ---
@@ -108,19 +106,18 @@ chat_id → groups[chat_id].workdir → registered worker (by cwd)
 
 - **Multi-group routing** — One Feishu bot serves multiple Claude Code instances, each in its own project
 - **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
-- **DM pairing** — Both Channel and Router modes support pairing-based onboarding
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support and custom trigger patterns
-- **Access control** — Pairing-based onboarding, allowlists, and per-group policies
-- **Confirm cards** — Interactive confirmation cards for risky actions (✅/❌ buttons + text reply)
-- **Permission cards** — Interactive approve/deny cards for tool permission requests
+- **Access control** — Allowlist-based user authorization and per-group policies
+- **Permission cards** — Interactive approve/deny cards for tool permission requests (✅ allow once / ✅✅ always allow / ❌ deny)
+- **Confirm cards** — Interactive confirmation cards for risky actions (✅ / ✅✅ / ❌ buttons + text reply)
 - **Unanswered reminders** — Auto-nudges at 30min / 60min / 120min if Claude hasn't replied
-- **Attachments** — Send and receive files and images
 - **Reactions** — Configurable emoji reactions on message receipt (default: 👍)
 - **Message editing** — Update previously sent messages (no push notification)
 - **Smart connection** — Only connects when launched as a Feishu channel
 - **Graceful shutdown** — Detects parent process exit via ppid polling
 - **Worker auto-reconnect** — Workers automatically reconnect to Router after disconnection
+- **Log rotation** — Automatic log rotation (5MB max, 3 backups) to prevent disk exhaustion
 
 ---
 
@@ -208,20 +205,27 @@ claude-feishu auth cli_YOUR_APP_ID YOUR_APP_SECRET
 
 Credentials are stored in `~/.claude/channels/feishu/.env` (mode 600).
 
-### Step 5: Pair Your Account
+### Step 5: Authorize Users
 
-1. Open Feishu and search for your bot by app name
-2. Send any message to the bot
-3. The bot replies with a pairing code and instructions
-4. In Claude Code, run:
+Add users to the allowlist by their Feishu open_id:
 
-   ```
-   claude-feishu access pair <code>
-   ```
+```bash
+claude-feishu access allow ou_xxxxxxxxxxxxxxxxxxxx
+```
 
-5. The bot confirms: *"Paired! Say hi to Claude."*
+To find a user's open_id, check the debug log after they send a message to the bot:
 
-You're ready — send messages to the bot and Claude will respond.
+```bash
+tail -5 ~/.claude/channels/feishu/debug.log
+```
+
+You can also set a default chat ID for outbound messages (optional):
+
+```bash
+claude-feishu auth chat-id oc_xxxxxxxxxxxxxxxxxxxx
+```
+
+You're ready — authorized users can now message the bot and Claude will respond.
 
 ---
 
@@ -261,23 +265,13 @@ cd /path/to/project-c && claude-feishu   # subsequent: connects to existing rout
 
 The **first** instance auto-spawns the Router. Subsequent instances connect as workers. The Router routes incoming messages by `chat_id → workdir → connected worker`.
 
-### 3. Pairing in Router Mode
-
-Router mode supports the same DM pairing flow as Channel mode. When an unknown user sends a DM:
-
-1. The Router generates a pairing code and replies with instructions
-2. The user runs `claude-feishu access pair <code>` in **any** connected Claude Code terminal
-3. The user is added to `allowFrom` and can now send messages
-
-> **Note:** Pairing approval must be done in a Claude Code terminal — never from Feishu messages (prompt injection protection).
-
-### 4. Manual Router Start (Optional)
+### 3. Manual Router Start (Optional)
 
 ```bash
 bun run router
 ```
 
-### 5. Check Router Status
+### 4. Check Router Status
 
 ```bash
 kill -USR1 $(pgrep -f 'bun router.ts')
@@ -300,26 +294,17 @@ claude-feishu access
 
 | Policy | Behavior |
 |---|---|
-| `pairing` (default) | Unknown users get a pairing code to approve |
-| `allowlist` | Unknown users are silently dropped |
+| `allowlist` (default) | Only users in `allowFrom` can send DMs; others are silently dropped |
 | `disabled` | All DMs dropped |
 
 ```
 claude-feishu access policy allowlist
 ```
 
-> **Tip:** Once all your users are paired, switch to `allowlist` to prevent unsolicited pairing requests.
-
 ### Manage Users
 
 ```bash
-# Approve a pairing
-claude-feishu access pair <code>
-
-# Deny a pairing
-claude-feishu access deny <code>
-
-# Manually allow a user by open_id
+# Allow a user by open_id
 claude-feishu access allow ou_xxxxxxxxxxxxxxxxxxxx
 
 # Remove a user
@@ -363,12 +348,10 @@ claude-feishu access set mentionPatterns ["@claude","@assistant"]
 
 ```
 ~/.claude/channels/feishu/
-├── .env              # App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET)
+├── .env              # App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_APP_CHAT_ID)
 ├── access.json       # Access control state (auto-managed)
-├── approved/         # Pairing approval signals (transient)
-├── inbox/            # Downloaded attachments
-├── debug.log         # Server debug log
-├── router-debug.log  # Router debug log (when using router)
+├── debug.log         # Server debug log (auto-rotated at 5MB, 3 backups)
+├── router-debug.log  # Router debug log (auto-rotated at 5MB, 3 backups)
 └── router.sock       # Unix socket for worker-router IPC
 ```
 
@@ -382,12 +365,10 @@ To use the same Feishu bot on multiple devices (e.g., office desktop + home lapt
 
 | File | Contains | Must Sync? |
 |---|---|---|
-| `.env` | App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET) | ✅ **Yes** — without this, the bot can't connect |
-| `access.json` | Access control (allowFrom, groups, policies, pending pairings) | ✅ **Yes** — without this, all users appear unpaired |
-| `approved/` | Transient pairing signals | ❌ No — auto-cleaned |
-| `inbox/` | Downloaded attachments | ❌ No — device-specific |
-| `debug.log` | Debug log | ❌ No — auto-created |
-| `router-debug.log` | Router debug log | ❌ No — auto-created |
+| `.env` | App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_APP_CHAT_ID) | ✅ **Yes** — without this, the bot can't connect |
+| `access.json` | Access control (allowFrom, groups, policies) | ✅ **Yes** — without this, all users appear unauthorized |
+| `debug.log` | Debug log | ❌ No — auto-created and auto-rotated |
+| `router-debug.log` | Router debug log | ❌ No — auto-created and auto-rotated |
 | `router.sock` | Unix socket | ❌ No — auto-created at runtime |
 
 ### How to Sync
@@ -434,7 +415,7 @@ This makes the entire state directory live in your synced folder — no symlinks
 
 - **Only one device should run the bot at a time** in Channel mode. Two simultaneous WebSocket connections from the same app may cause message loss or duplication.
 - **Router mode is safe for multi-device**: each device runs its own Worker, and the Router handles deduplication. But only one device should run the Router.
-- **`access.json` changes are not auto-synced**: if you approve a pairing on device A, device B won't see it until the file syncs. The 2-second access cache means changes take effect quickly after sync.
+- **`access.json` changes are not auto-synced**: if you add a user on device A, device B won't see it until the file syncs. The 2-second access cache means changes take effect quickly after sync.
 - **`workdir` paths in `access.json` are absolute**: `/home/user/project-a` on one device may not exist on another. Use consistent paths or adjust per device.
 
 ---
@@ -446,7 +427,8 @@ This makes the entire state directory live in your synced folder — no symlinks
 | `FEISHU_APP_ID` | Yes | Feishu app ID (`cli_...`) |
 | `FEISHU_APP_SECRET` | Yes | Feishu app secret |
 | `FEISHU_ENCRYPT_KEY` | No | Event payload encryption key |
-| `FEISHU_ACCESS_MODE` | No | Set to `static` to disable pairing (downgrades to allowlist) |
+| `FEISHU_APP_CHAT_ID` | No | Default chat ID for outbound messages (fallback when no chat_id is specified) |
+| `FEISHU_ACCESS_MODE` | No | Set to `static` to use allowlist-only mode (no runtime access.json writes) |
 | `FEISHU_STATE_DIR` | No | Override state directory path (default: `~/.claude/channels/feishu/`) |
 
 ---
@@ -469,12 +451,16 @@ When a worker's Unix socket connection to the Router breaks, it automatically at
 
 The `access.json` file is cached with a 2-second TTL based on file modification time. This avoids redundant `readFileSync` calls on every message while still reflecting configuration changes within seconds.
 
+### Log Rotation
+
+Debug logs (`debug.log`, `router-debug.log`) are automatically rotated when they exceed 5MB. Up to 3 backup files are kept (`debug.log.1`, `debug.log.2`, `debug.log.3`). Rotation is checked lazily every 100 writes to minimize overhead.
+
 ---
 
 ## Testing & Development
 
 ```bash
-bun test              # Run tests (58 tests, 226 assertions)
+bun test              # Run tests (65 tests)
 bun run lint          # Check code style with Biome
 bun run lint:fix      # Auto-fix code style issues
 bun run format        # Format code with Biome
@@ -482,7 +468,7 @@ bun run typecheck     # TypeScript type checking
 bun run check         # Full check: typecheck + lint + test
 ```
 
-Tests cover: access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, chat authorization, message parsing, attachment info, timestamp formatting, expired entry pruning, router workdir resolution, and access caching.
+Tests cover: access control (gate logic), text chunking, mention detection, permission reply parsing (including `yy`/`yesyes` for always-allow), confirm code generation, chat authorization, chat ID resolution and fallback, message parsing, attachment info, timestamp formatting, log rotation, router workdir resolution, and access caching.
 
 ---
 
@@ -491,13 +477,14 @@ Tests cover: access control (gate logic), text chunking, mention detection, perm
 - Credentials stored with `chmod 600` — only the owner can read them
 - State directory uses `chmod 700`
 - Router Unix socket uses `chmod 600`
-- Pairing codes expire after 1 hour
-- After 2 unapproved messages, senders are silently dropped until the code expires
-- Maximum 3 concurrent pending pairing codes
+- Confirm codes use 8-byte cryptographic randomness (`crypto.randomBytes`)
 - Access mutations can only be made from the Claude Code terminal — never from channel messages (prompt injection protection)
-- File path validation prevents sending channel state files
 - Chat allowlist prevents unauthorized message delivery
-- Confirm codes use characters excluding easily confused `l`
+- Log rotation prevents disk exhaustion from unbounded log growth
+- Log output redacts sensitive IDs (open_id, chat_id)
+- PID validation prevents misidentifying ancestor processes
+- Regex escaping prevents injection in CLI pattern handling
+- Pending permissions and confirms auto-expire after 1 hour
 
 ---
 
@@ -531,14 +518,16 @@ mkdir -p ~/.claude/channels/feishu
 cat > ~/.claude/channels/feishu/.env << 'EOF'
 FEISHU_APP_ID=cli_YOUR_APP_ID
 FEISHU_APP_SECRET=YOUR_APP_SECRET
+FEISHU_APP_CHAT_ID=oc_YOUR_CHAT_ID
 EOF
 chmod 600 ~/.claude/channels/feishu/.env
 ```
 
-Or use the skill command inside a Claude Code session:
+Or use the CLI command inside a Claude Code session:
 
 ```
 claude-feishu auth cli_YOUR_APP_ID YOUR_APP_SECRET
+claude-feishu auth chat-id oc_YOUR_CHAT_ID
 ```
 
 ### Multi-Group Router Configuration
@@ -547,7 +536,7 @@ Write `~/.claude/channels/feishu/access.json`:
 
 ```json
 {
-  "dmPolicy": "pairing",
+  "dmPolicy": "allowlist",
   "allowFrom": [],
   "p2pChats": {},
   "groups": {
@@ -562,7 +551,6 @@ Write `~/.claude/channels/feishu/access.json`:
       "workdir": "/absolute/path/to/project-b"
     }
   },
-  "pending": {},
   "ackReaction": "Get",
   "defaultWorkdir": "/absolute/path/to/default-project"
 }
@@ -571,7 +559,7 @@ Write `~/.claude/channels/feishu/access.json`:
 Key fields:
 - `groups[chat_id].workdir` — maps a Feishu group to a project directory
 - `defaultWorkdir` — fallback for DMs and groups without explicit workdir
-- `dmPolicy` — `pairing` (default), `allowlist`, or `disabled`
+- `dmPolicy` — `allowlist` (default) or `disabled`
 - `ackReaction` — emoji code for read receipts (default: `Get`)
 
 ### Launch Commands
@@ -585,18 +573,18 @@ cd /path/to/project-a && claude-feishu &  # first: spawns Router
 cd /path/to/project-b && claude-feishu &  # connects as worker
 ```
 
-### Pairing Flow (Automated)
+### User Authorization
 
-After a user sends a DM to the bot, they receive a pairing code. Approve it:
+Pre-authorize users by open_id:
 
-```
-claude-feishu access pair ABCDE
-```
-
-Or pre-authorize users by open_id:
-
-```
+```bash
 claude-feishu access allow ou_xxxxxxxxxxxxxxxxxxxx
+```
+
+To find a user's open_id, check the debug log after they send a message:
+
+```bash
+tail -5 ~/.claude/channels/feishu/debug.log
 ```
 
 ### Verification Checklist
@@ -626,9 +614,10 @@ tail -5 ~/.claude/channels/feishu/router-debug.log
 | Bot not responding | `debug.log` for errors | Verify credentials in `.env` |
 | Router not starting | `router-debug.log` | Check if port/socket is in use |
 | Worker not connecting | `debug.log` for "worker" entries | Verify Router socket exists |
-| Pairing code not received | `dmPolicy` in `access.json` | Must be `pairing`, not `disabled` |
+| DMs silently dropped | `dmPolicy` in `access.json` | Must be `allowlist`, not `disabled`; add user to `allowFrom` |
 | Group messages ignored | Group in `access.json`? | `claude-feishu access group add <chat_id>` |
 | Card buttons not working | Callback configured? | Add `card.action.trigger` in Feishu app |
+| No default chat for outbound | `FEISHU_APP_CHAT_ID` set? | `claude-feishu auth chat-id <chat_id>` |
 
 ---
 
